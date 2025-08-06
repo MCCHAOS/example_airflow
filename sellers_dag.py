@@ -4,6 +4,12 @@ from datetime import datetime
 import json
 import requests
 from sqlalchemy import Table, Column, String, Integer, Float, MetaData, Numeric, create_engine
+import hashlib
+
+def generate_md5_from_array(data_values):
+    """Generate MD5 hash from array of values"""
+    data_str = json.dumps(data_values, sort_keys=True, default=str)
+    return hashlib.md5(data_str.encode()).hexdigest()
 
 # Endpoint name used to construct the staging table name and various task IDs
 endpointName="sellers"
@@ -18,8 +24,26 @@ target_table = Table(
     Column("seller_id", String(32), primary_key=True),
     Column("seller_zip_code", String(16)),    
 	Column("seller_city", String(64)),
-	Column("seller_state", String(64))
+	Column("seller_state", String(64)), 
+    Column("md5_hash", String(32)),
+    Column("dv_load_timestamp", String(32))
 # Add more columns as needed based on the API response structure
+)
+
+# Create archive table by copying column definitions with modified primary keys
+archive_columns = []
+for col in target_table.columns:
+    # For archive table, make dv_load_timestamp part of composite PK
+    if col.name == 'dv_load_timestamp':
+        archive_columns.append(Column(col.name, col.type, primary_key=True))
+    else:
+        # Keep original primary key status for other columns
+        archive_columns.append(Column(col.name, col.type, primary_key=col.primary_key))
+
+archive_table = Table(
+    f"{endpointName}_duplicate_archive",
+    target_metadata,
+    *archive_columns    
 )
 
 # --- API Connection Details (students should fill these in) ---
@@ -58,11 +82,9 @@ LOAD_TO_DB_TASK_ID=f"load_{endpointName}_to_db_task"
 def load_data_to_db(ti):
     """
     Fetches data from XCom, connects to the target database,
-    and loads the data into a table.
-    Students should implement the logic to parse the JSON, connect to MySQL,
-    and insert the data into their defined table.
+    and loads the data into a table with deduplication logic.
     """
-    api_data_json = ti.xcom_pull(task_ids=API_FETCH_TASK_ID) # Updated task_id
+    api_data_json = ti.xcom_pull(task_ids=API_FETCH_TASK_ID)
     
     if not api_data_json:
         print("No data fetched. Exiting load process.")
@@ -74,22 +96,23 @@ def load_data_to_db(ti):
         print("API returned empty data. Nothing to load.")
         return
 
-    # Example hint for database connection and table creation:
+    # Database connection setup
     db_url = (
         f"postgresql+psycopg2://{MYSQL_USERNAME}:{MYSQL_PASSWORD}@"
         f"{MYSQL_HOST}:{MYSQL_PORT}/{MYSQL_DB_NAME}"
     )
     engine = create_engine(db_url)
     
-    # Create the target table if it doesn't exist
-    print(f"Attempting to create table '{target_table.name}' if it does not exist...")
-    target_metadata.create_all(engine, tables=[target_table], checkfirst=True)
-    print(f"Table '{target_table.name}' creation check complete.")
+    # Create tables if they don't exist
+    print(f"Creating tables if they don't exist...")
+    target_metadata.create_all(engine, tables=[target_table, archive_table], checkfirst=True)
+    print(f"Table creation check complete.")
     
-    # Get a direct database connection and cursor for data insertion
-    # Using pymysql directly for insertion as MySqlHook is no longer used for connection details
+    # Database connection for data operations
     import psycopg2
-    from psycopg2.extras import execute_values 
+    from psycopg2.extras import execute_values
+    from datetime import datetime
+    
     conn = psycopg2.connect(
         host=MYSQL_HOST,
         port=MYSQL_PORT,
@@ -98,21 +121,62 @@ def load_data_to_db(ti):
         database=MYSQL_DB_NAME
     )
     cursor = conn.cursor()
-    columns = [col.name for col in target_table.columns]
-    insert_values = []
+    
+    # Get column definitions
+    data_columns = [col.name for col in target_table.columns 
+                   if col.name not in ['md5_hash', 'dv_load_timestamp']]
+    all_columns = [col.name for col in target_table.columns]
+    current_timestamp = datetime.now().isoformat()
+    
+    # Calculate hashes for all records
+    records_with_hash = []
     for record in api_data:
-        row_values = []
-        for col_name in columns:
-            row_values.append(record.get(col_name))
-        insert_values.append(tuple(row_values))
-
-    placeholders = ', '.join(['%s'] * len(columns))
-    insert_stmt = f"INSERT INTO {target_table.name} ({', '.join(columns)}) VALUES %s"
-
+        data_values = [record.get(col) for col in data_columns]
+        record_hash = generate_md5_from_array(data_values)
+        full_record = [record.get(col) for col in data_columns] + [record_hash, current_timestamp]
+        records_with_hash.append((record_hash, tuple(full_record)))
+    
+    # Bulk check for existing hashes
+    all_hashes = [item[0] for item in records_with_hash]
+    if all_hashes:
+        hash_placeholders = ','.join(['%s'] * len(all_hashes))
+        cursor.execute(
+            f"SELECT md5_hash FROM {target_table.name} WHERE md5_hash IN ({hash_placeholders})",
+            all_hashes
+        )
+        existing_hashes = {row[0] for row in cursor.fetchall()}
+    else:
+        existing_hashes = set()
+    
+    # Split records into new and duplicates
+    new_records = []
+    duplicate_records = []
+    
+    for record_hash, full_record in records_with_hash:
+        if record_hash in existing_hashes:
+            duplicate_records.append(full_record)
+        else:
+            new_records.append(full_record)
+    
     try:
-        execute_values(cursor, insert_stmt, insert_values)
+        # Insert new records into main table
+        if new_records:
+            insert_stmt = f"INSERT INTO {target_table.name} ({', '.join(all_columns)}) VALUES %s"
+            execute_values(cursor, insert_stmt, new_records)
+            print(f"Inserted {len(new_records)} new records into '{target_table.name}'.")
+        
+        # Insert duplicates into archive table
+        if duplicate_records:
+            archive_stmt = f"INSERT INTO {archive_table.name} ({', '.join(all_columns)}) VALUES %s"
+            execute_values(cursor, archive_stmt, duplicate_records)
+            print(f"Archived {len(duplicate_records)} duplicate records to '{archive_table.name}'.")
+        
+        if not new_records and not duplicate_records:
+            print("No records to process.")
+        
         conn.commit()
-        print(f"Successfully loaded {len(api_data)} records into '{target_table.name}'.")
+        print(f"Successfully processed {len(api_data)} total records.")
+        
     except Exception as e:
         conn.rollback()
         print(f"Error loading data: {e}")

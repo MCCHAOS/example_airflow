@@ -4,23 +4,50 @@ from datetime import datetime
 import json
 import requests
 from sqlalchemy import Table, Column, String, Integer, Float, MetaData, Numeric, create_engine
+import hashlib
+
+def generate_md5_from_array(data_values):
+    """Generate MD5 hash from array of values"""
+    data_str = json.dumps(data_values, sort_keys=True, default=str)
+    return hashlib.md5(data_str.encode()).hexdigest()
+
+# Endpoint name used to construct the staging table name and various task IDs
+endpointName="orders"
 
 # --- Define a sample target table schema (students can adapt this) ---
 # This section defines the structure of the table where data will be loaded.
 # Students should define columns that match the data they expect from the API.
 target_metadata = MetaData()
-target_orders_table = Table(
-"orders", # Students should replace this with their desired table name
-target_metadata,
-Column("order_id", String(32), primary_key=True),
+target_table = Table(
+    endpointName, # Students should replace this with their desired table name
+    target_metadata,
+    Column("order_id", String(32), primary_key=True),
     Column("user_name", String(32)),
     Column("order_status", String(10)),
     Column("order_date", String(16)),
     Column("order_approved_date", String(16)),
     Column("pickup_date", String(16)),
     Column("delivered_date", String(16)),
-    Column("estimated_time_delivery", String(16))
+    Column("estimated_time_delivery", String(16)),
+    Column("md5_hash", String(32)),
+    Column("dv_load_timestamp", String(32))
 # Add more columns as needed based on the API response structure
+)
+
+# Create archive table by copying column definitions with modified primary keys
+archive_columns = []
+for col in target_table.columns:
+    # For archive table, make dv_load_timestamp part of composite PK
+    if col.name == 'dv_load_timestamp':
+        archive_columns.append(Column(col.name, col.type, primary_key=True))
+    else:
+        # Keep original primary key status for other columns
+        archive_columns.append(Column(col.name, col.type, primary_key=col.primary_key))
+
+archive_table = Table(
+    f"{endpointName}_duplicate_archive",
+    target_metadata,
+    *archive_columns    
 )
 
 # --- API Connection Details (students should fill these in) ---
@@ -35,60 +62,61 @@ MYSQL_DB_NAME = "airflow" # e.g., "STAGELOAD"
 MYSQL_USERNAME = "airflow" # e.g., "rootroot"
 MYSQL_PASSWORD = "airflow" # e.g., "root"
 
+API_FETCH_TASK_ID=f"fetch_{endpointName}_from_api_task"
 def fetch_data_from_api_callable():
     """
     Python callable to fetch data from the API.
     Students should implement the logic to make an authenticated HTTP GET request
     and return the raw JSON response text.
-    """
-    print(f"Fetching data from: {API_BASE_URL}/some_endpoint/")
-    # Example hint:
-    endpoint = f"{API_BASE_URL}/orders/"
+    """       
+    endpoint = f"{API_BASE_URL}/{endpointName}/"
+    print(f"Fetching data from: {endpoint}")
+    
     try:
         response = requests.get(endpoint, auth=(API_USERNAME, API_PASSWORD))
         response.raise_for_status()
-        orders_data_json = response.text
-        print(f"Successfully fetched {len(orders_data_json)} bytes from API.")
-        return orders_data_json
+        api_data_json = response.text
+        print(f"Successfully fetched {len(api_data_json)} bytes from API.")
+        return api_data_json
     except requests.exceptions.RequestException as e:
         print(f"Error fectching data from API: {e}")
         raise 
 
+LOAD_TO_DB_TASK_ID=f"load_{endpointName}_to_db_task"
 def load_data_to_db(ti):
     """
     Fetches data from XCom, connects to the target database,
-    and loads the data into a table.
-    Students should implement the logic to parse the JSON, connect to MySQL,
-    and insert the data into their defined table.
+    and loads the data into a table with deduplication logic.
     """
-    orders_data_json = ti.xcom_pull(task_ids='fetch_orders_from_api_task') # Updated task_id
+    api_data_json = ti.xcom_pull(task_ids=API_FETCH_TASK_ID)
     
-    if not orders_data_json:
+    if not api_data_json:
         print("No data fetched. Exiting load process.")
         return
 
-    orders_data = json.loads(orders_data_json)
+    api_data = json.loads(api_data_json)
 
-    if not orders_data:
+    if not api_data:
         print("API returned empty data. Nothing to load.")
         return
 
-    # Example hint for database connection and table creation:
+    # Database connection setup
     db_url = (
         f"postgresql+psycopg2://{MYSQL_USERNAME}:{MYSQL_PASSWORD}@"
         f"{MYSQL_HOST}:{MYSQL_PORT}/{MYSQL_DB_NAME}"
     )
     engine = create_engine(db_url)
     
-    # Create the target table if it doesn't exist
-    print(f"Attempting to create table '{target_orders_table.name}' if it does not exist...")
-    target_metadata.create_all(engine, tables=[target_orders_table], checkfirst=True)
-    print(f"Table '{target_orders_table.name}' creation check complete.")
+    # Create tables if they don't exist
+    print(f"Creating tables if they don't exist...")
+    target_metadata.create_all(engine, tables=[target_table, archive_table], checkfirst=True)
+    print(f"Table creation check complete.")
     
-    # Get a direct database connection and cursor for data insertion
-    # Using pymysql directly for insertion as MySqlHook is no longer used for connection details
+    # Database connection for data operations
     import psycopg2
-    from psycopg2.extras import execute_values 
+    from psycopg2.extras import execute_values
+    from datetime import datetime
+    
     conn = psycopg2.connect(
         host=MYSQL_HOST,
         port=MYSQL_PORT,
@@ -97,22 +125,62 @@ def load_data_to_db(ti):
         database=MYSQL_DB_NAME
     )
     cursor = conn.cursor()
-    #
-    columns = [col.name for col in target_orders_table.columns]
-    insert_values = []
-    for order_record in orders_data:
-        row_values = []
-        for col_name in columns:
-            row_values.append(order_record.get(col_name))
-        insert_values.append(tuple(row_values))
-
-    placeholders = ', '.join(['%s'] * len(columns))
-    insert_stmt = f"INSERT INTO {target_orders_table.name} ({', '.join(columns)}) VALUES %s"
-
+    
+    # Get column definitions
+    data_columns = [col.name for col in target_table.columns 
+                   if col.name not in ['md5_hash', 'dv_load_timestamp']]
+    all_columns = [col.name for col in target_table.columns]
+    current_timestamp = datetime.now().isoformat()
+    
+    # Calculate hashes for all records
+    records_with_hash = []
+    for record in api_data:
+        data_values = [record.get(col) for col in data_columns]
+        record_hash = generate_md5_from_array(data_values)
+        full_record = [record.get(col) for col in data_columns] + [record_hash, current_timestamp]
+        records_with_hash.append((record_hash, tuple(full_record)))
+    
+    # Bulk check for existing hashes
+    all_hashes = [item[0] for item in records_with_hash]
+    if all_hashes:
+        hash_placeholders = ','.join(['%s'] * len(all_hashes))
+        cursor.execute(
+            f"SELECT md5_hash FROM {target_table.name} WHERE md5_hash IN ({hash_placeholders})",
+            all_hashes
+        )
+        existing_hashes = {row[0] for row in cursor.fetchall()}
+    else:
+        existing_hashes = set()
+    
+    # Split records into new and duplicates
+    new_records = []
+    duplicate_records = []
+    
+    for record_hash, full_record in records_with_hash:
+        if record_hash in existing_hashes:
+            duplicate_records.append(full_record)
+        else:
+            new_records.append(full_record)
+    
     try:
-        execute_values(cursor, insert_stmt, insert_values)
+        # Insert new records into main table
+        if new_records:
+            insert_stmt = f"INSERT INTO {target_table.name} ({', '.join(all_columns)}) VALUES %s"
+            execute_values(cursor, insert_stmt, new_records)
+            print(f"Inserted {len(new_records)} new records into '{target_table.name}'.")
+        
+        # Insert duplicates into archive table
+        if duplicate_records:
+            archive_stmt = f"INSERT INTO {archive_table.name} ({', '.join(all_columns)}) VALUES %s"
+            execute_values(cursor, archive_stmt, duplicate_records)
+            print(f"Archived {len(duplicate_records)} duplicate records to '{archive_table.name}'.")
+        
+        if not new_records and not duplicate_records:
+            print("No records to process.")
+        
         conn.commit()
-        print(f"Successfully loaded {len(orders_data)} records into '{target_orders_table.name}'.")
+        print(f"Successfully processed {len(api_data)} total records.")
+        
     except Exception as e:
         conn.rollback()
         print(f"Error loading data: {e}")
@@ -124,11 +192,11 @@ def load_data_to_db(ti):
 
 # Define the Airflow DAG
 with DAG(
-    dag_id='orders_data_pipeline', # A more generic DAG ID
+    dag_id=f'{endpointName}_data_pipeline', # A more generic DAG ID
     start_date=datetime(2023, 1, 1),
     schedule_interval=None,
     catchup=False,
-    tags=['data_pipeline', 'api_integration', 'mysql'],
+    tags=['data_pipeline', 'api_integration', 'postgresql'],
     doc_md="""
     ### API to Database Data Pipeline Sample
     This DAG provides a skeletal structure for fetching data from an external API
@@ -149,17 +217,17 @@ with DAG(
     """
 ) as dag:
     # Task to fetch data from the API
-    fetch_orders_from_api_task = PythonOperator(
-        task_id='fetch_orders_from_api_task',
+    fetch_from_api_task = PythonOperator(
+        task_id=API_FETCH_TASK_ID,
         python_callable=fetch_data_from_api_callable,
         )
 
     # Task to load the fetched data into the database
-    load_orders_to_db_task = PythonOperator(
-        task_id='load_orders_to_db_task',
+    load_to_db_task = PythonOperator(
+        task_id=LOAD_TO_DB_TASK_ID,
         python_callable=load_data_to_db,
         provide_context=True,
         )
 
     # Define the task dependencies
-    fetch_orders_from_api_task >> load_orders_to_db_task
+    fetch_from_api_task >> load_to_db_task
