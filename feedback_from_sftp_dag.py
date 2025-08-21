@@ -22,13 +22,14 @@ def generate_md5_from_array(data_values):
 
 # Endpoint name used to construct the staging table name and various task IDs
 endpointName="feedback"
+target_table_name="feedback"
 
 # --- Define a sample target table schema (students can adapt this) ---
 # This section defines the structure of the table where data will be loaded.
 # Students should define columns that match the data they expect from the API.
 target_metadata = MetaData()
 target_table = Table(
-    endpointName, # Students should replace this with their desired table name
+    target_table_name, # Students should replace this with their desired table name
     target_metadata,
     Column("feedback_id", String(32), primary_key=True),
     Column("order_id", String(32)),

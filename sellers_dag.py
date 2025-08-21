@@ -13,13 +13,14 @@ def generate_md5_from_array(data_values):
 
 # Endpoint name used to construct the staging table name and various task IDs
 endpointName="sellers"
+target_table_name="seller"
 
 # --- Define a sample target table schema (students can adapt this) ---
 # This section defines the structure of the table where data will be loaded.
 # Students should define columns that match the data they expect from the API.
 target_metadata = MetaData()
 target_table = Table(
-    endpointName, # Students should replace this with their desired table name
+    target_table_name, # Students should replace this with their desired table name
     target_metadata,
     Column("seller_id", String(32), primary_key=True),
     Column("seller_zip_code", String(16)),    
@@ -41,7 +42,7 @@ for col in target_table.columns:
         archive_columns.append(Column(col.name, col.type, primary_key=col.primary_key))
 
 archive_table = Table(
-    f"{endpointName}_duplicate_archive",
+    f"{target_table_name}_duplicate_archive",
     target_metadata,
     *archive_columns    
 )
